@@ -4,8 +4,8 @@ main.py - Main Pipeline for Trajectory Polyhedra Analysis & OVITO Visualization
 
 This script manages I/O and all calculations needed for visualization outputs:
   - Takes from_frame and to_frame inputs (via CLI flags, positional arguments, or interactive prompt).
-  - Imports core geometry and reference functions from `count.py`:
-      `angle_rms`, `tetrahedral_ideal`, `octahedral_ideal`, `tetra_limit`, `octa_limit`.
+  - Shares Fe geometry and periodic neighbor filtering with `count.py`.
+  - Classifies O-centered environments and transfers supported phase labels to Fe.
   - Calculates per-atom visualization properties (fe_type, parent_fe_id array, coordination numbers, angle RMS).
   - Includes all parent Fe IDs (tetrahedral, octahedral, and other Fe parents) in parent_fe_id.
   - Exports per-frame OVITO visualization files (.extxyz, .dump).
@@ -16,9 +16,11 @@ import os
 import sys
 import argparse
 import warnings
+import json
+from dataclasses import asdict
 from collections import defaultdict
 from concurrent.futures import ProcessPoolExecutor, as_completed
-from typing import Dict, Any, List, Optional
+from typing import Dict, Any, Optional
 
 import numpy as np
 import pandas as pd
@@ -30,12 +32,14 @@ warnings.filterwarnings("ignore", category=UserWarning, module="pymatgen")
 
 # Import the core geometric algorithm and constants from count.py
 from count import (
-    angle_rms,
-    tetrahedral_ideal,
-    octahedral_ideal,
+    fe_geometry,
+    oxygen_neighbors,
     tetra_limit as DEFAULT_TETRA_LIMIT,
     octa_limit as DEFAULT_OCTA_LIMIT,
 )
+
+from phase import (PhaseConfig, PHASE_NAMES, REASONS, FEATURE_NAMES,
+                   classify_phases, load_reference_model)
 
 
 def calculate_frame_properties(
@@ -43,163 +47,124 @@ def calculate_frame_properties(
     t_limit: float = DEFAULT_TETRA_LIMIT,
     o_limit: float = DEFAULT_OCTA_LIMIT,
     crystal_nn: Optional[CrystalNN] = None,
+    phase_config: Optional[PhaseConfig] = None,
+    reference_model: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
+    """Build one periodic bipartite graph, Fe geometry, then O-first phases.
+
+    Original property names and IDs are retained. parent_fe_id and O CN count
+    periodic bonds, so a small cell may repeat a base site ID for different images.
+    O parent_type_id denotes sharing categories, independently of phase_id.
     """
-    Perform all per-atom calculations needed for OVITO visualization and summary CSV:
-      1. Classifies Fe atoms into Oct (0), Tet (1), or Other (2) using angle_rms from count.py.
-      2. Assembles the parent_fe_id array containing all parent Fe IDs for every atom
-         (including tetrahedral, octahedral, and other Fe parents).
-      3. Computes parent sharing counts (n_oct_parents, n_tet_parents, n_other_parents) and parent_type_id.
-    """
+    config = phase_config or PhaseConfig()
+    if not all(np.isfinite(x) and x > 0 for x in (t_limit, o_limit)):
+        raise ValueError("Angle limits must be finite and positive")
+    symbols = [site.specie.symbol for site in structure]
+    if set(symbols) - {"Fe", "O"}:
+        raise ValueError("The phase pipeline supports Fe/O structures only")
     if crystal_nn is None:
         crystal_nn = CrystalNN()
-
-    n_atoms = len(structure)
-
-    fe_type = np.full(n_atoms, -1, dtype=int)
-    coordination_number = np.zeros(n_atoms, dtype=int)
-    angle_rms_val = np.full(n_atoms, -1.0, dtype=float)
-
-    n_oct_parents = np.zeros(n_atoms, dtype=int)
-    n_tet_parents = np.zeros(n_atoms, dtype=int)
-    n_other_parents = np.zeros(n_atoms, dtype=int)
-    parent_type_id = np.full(n_atoms, -1, dtype=int)
-
-    # Oxygen parent Fe mapping: o_site_index -> list of 1-based parent Fe IDs (Oct, Tet, and Other)
-    oxygen_parents_map = defaultdict(list)
-
-    oct_count = 0
-    tet_count = 0
-    other_count = 0
-    total_fe = 0
-    total_o = 0
-
-    tetra_rms_list: List[float] = []
-    octa_rms_list: List[float] = []
-
-    for i, atom in enumerate(structure):
-        if atom.specie.symbol != "Fe":
-            continue
-
-        total_fe += 1
-        fe_id = i + 1  # 1-based Fe atom ID
-
-        neighbors = crystal_nn.get_nn_info(structure, i)
-        oxygen_neighbors = [
-            nb for nb in neighbors
-            if nb["site"].specie.symbol == "O"
-        ]
-
-        cn = len(oxygen_neighbors)
-        coordination_number[i] = cn
-
-        if cn == 4:
-            vectors = np.array([
-                nb["site"].coords - atom.coords
-                for nb in oxygen_neighbors
-            ])
-            rms = angle_rms(vectors, tetrahedral_ideal)
-            angle_rms_val[i] = rms
-            if rms <= t_limit:
-                ft = 1  # Tetrahedral
-                tet_count += 1
-                tetra_rms_list.append(rms)
-            else:
-                ft = 2  # Distorted 4-coord -> Other
-                other_count += 1
-        elif cn == 6:
-            vectors = np.array([
-                nb["site"].coords - atom.coords
-                for nb in oxygen_neighbors
-            ])
-            rms = angle_rms(vectors, octahedral_ideal)
-            angle_rms_val[i] = rms
-            if rms <= o_limit:
-                ft = 0  # Octahedral
-                oct_count += 1
-                octa_rms_list.append(rms)
-            else:
-                ft = 2  # Distorted 6-coord -> Other
-                other_count += 1
+    n = len(structure)
+    fe_indices = [i for i, symbol in enumerate(symbols) if symbol == "Fe"]
+    o_indices = [i for i, symbol in enumerate(symbols) if symbol == "O"]
+    fe_type = np.full(n, -1, dtype=int)
+    cn = np.zeros(n, dtype=int)
+    rms = np.full(n, -1.)
+    distortion = np.full(n, -1.)
+    soft = np.zeros((n, 3))
+    stability = np.full(n, -1.)  # -1: cutoff sensitivity not evaluated
+    fe_to_o = {i: [] for i in fe_indices}
+    o_to_fe = {i: [] for i in o_indices}
+    shell_rows = defaultdict(list)
+    if config.neighbor_method == "cutoff" and o_indices and fe_indices:
+        centers, neighbors, images, distances = structure.get_neighbor_list(
+            config.bond_cutoff + config.cutoff_delta,
+            sites=[structure[i] for i in fe_indices])
+        for center, neighbor, image, distance in zip(centers, neighbors, images, distances):
+            if symbols[neighbor] == "O":
+                shell_rows[fe_indices[center]].append((int(neighbor), image, distance))
+    for i in fe_indices:
+        if config.neighbor_method == "crystalnn":
+            neighbors = oxygen_neighbors(structure, i, crystal_nn) if o_indices else []
+            vectors = [nb["site"].coords - structure[i].coords for nb in neighbors]
+            targets = [int(nb["site_index"]) for nb in neighbors]
         else:
-            ft = 2  # Other CN (nor tetra neither octa)
-            other_count += 1
+            rows = shell_rows[i]
+            selected = [(j, image) for j, image, d in rows if d <= config.bond_cutoff]
+            targets = [j for j, _ in selected]
+            vectors = [structure.lattice.get_cartesian_coords(
+                structure[j].frac_coords + image - structure[i].frac_coords)
+                for j, image in selected]
+            low = sum(d <= config.bond_cutoff - config.cutoff_delta for _, _, d in rows)
+            high = len(rows)
+            stability[i] = 1. / (1 + high - low)
+        ft, value, dr, scores = fe_geometry(vectors, t_limit, o_limit, config.bond_limit)
+        if stability[i] >= 0:
+            scores[:2] *= stability[i]
+            scores[2] = 1 - scores[:2].sum()
+        fe_type[i], cn[i], rms[i], distortion[i], soft[i] = ft, len(targets), value, dr, scores
+        fe_to_o[i] = targets
+        for o in targets:
+            o_to_fe[o].append(i)
 
-        fe_type[i] = ft
-
-        # Every oxygen neighbor records this Fe atom as a parent (Oct, Tet, or Other)
-        for nb in oxygen_neighbors:
-            o_idx = nb["site_index"]
-            coordination_number[o_idx] += 1
-            oxygen_parents_map[o_idx].append(fe_id)
-            if ft == 0:
-                n_oct_parents[o_idx] += 1
-            elif ft == 1:
-                n_tet_parents[o_idx] += 1
-            else:
-                n_other_parents[o_idx] += 1
-
-    # Dimension of parent_fe_id array (at least 6 components)
-    max_parents = 6
-    if oxygen_parents_map:
-        max_parents = max(6, max(len(p) for p in oxygen_parents_map.values()))
-
-    parent_fe_id = np.zeros((n_atoms, max_parents), dtype=int)
-
-    # Fe atoms: first component is its own Fe ID
-    for i, atom in enumerate(structure):
-        if atom.specie.symbol == "Fe":
-            parent_fe_id[i, 0] = i + 1
-
-    # Oxygen atoms: fill all parent Fe IDs (Oct, Tet, and Other)
-    for i, atom in enumerate(structure):
-        if atom.specie.symbol != "O":
-            continue
-
-        total_o += 1
-        parents = oxygen_parents_map[i]
-        if parents:
-            parent_fe_id[i, :len(parents)] = parents[:max_parents]
-
-        # Categorical sharing classification for Oxygen
-        has_oct = n_oct_parents[i] > 0
-        has_tet = n_tet_parents[i] > 0
-        has_oth = n_other_parents[i] > 0
-
-        if has_oct and not has_tet and not has_oth:
-            parent_type_id[i] = 0  # Octahedral only
-        elif has_tet and not has_oct and not has_oth:
-            parent_type_id[i] = 1  # Tetrahedral only
-        elif has_oth and not has_oct and not has_tet:
-            parent_type_id[i] = 2  # Other only
-        elif has_oct and has_tet and not has_oth:
-            parent_type_id[i] = 3  # Shared Oct + Tet
-        elif has_oct and has_oth and not has_tet:
-            parent_type_id[i] = 4  # Shared Oct + Other
-        elif has_tet and has_oth and not has_oct:
-            parent_type_id[i] = 5  # Shared Tet + Other
-        elif has_oct and has_tet and has_oth:
-            parent_type_id[i] = 6  # Shared Oct + Tet + Other
-        else:
-            parent_type_id[i] = -1  # Unbound / Free Oxygen
-
-    return {
-        "fe_type": fe_type,
-        "parent_fe_id": parent_fe_id,
-        "coordination_number": coordination_number,
-        "angle_rms": angle_rms_val,
-        "parent_type_id": parent_type_id,
-        "n_oct_parents": n_oct_parents,
-        "n_tet_parents": n_tet_parents,
-        "n_other_parents": n_other_parents,
-        "octahedral_count": oct_count,
-        "tetrahedral_count": tet_count,
-        "other_count": other_count,
-        "total_fe": total_fe,
-        "total_o": total_o,
-        "octa_rms_list": octa_rms_list,
-        "tetra_rms_list": tetra_rms_list,
+    n_oct, n_tet, n_other = (np.zeros(n, dtype=int) for _ in range(3))
+    parent_type = np.full(n, -1, dtype=int)
+    max_parents = max(6, max((len(v) for v in o_to_fe.values()), default=0))
+    parents = np.zeros((n, max_parents), dtype=int)
+    for i in fe_indices:
+        parents[i, 0] = i + 1
+    # Existing sharing category IDs, retained for saved OVITO visualizations.
+    sharing = {(True, False, False): 0, (False, True, False): 1,
+               (False, False, True): 2, (True, True, False): 3,
+               (True, False, True): 4, (False, True, True): 5,
+               (True, True, True): 6}
+    soft_parents = np.zeros((n, 3))
+    for o, indices in o_to_fe.items():
+        cn[o] = len(indices)
+        parents[o, :len(indices)] = np.asarray(indices, dtype=int) + 1
+        labels = fe_type[indices]
+        n_oct[o], n_tet[o], n_other[o] = (np.count_nonzero(labels == k) for k in (0, 1, 2))
+        parent_type[o] = sharing.get((n_oct[o] > 0, n_tet[o] > 0, n_other[o] > 0), -1)
+        if indices:
+            soft_parents[o] = soft[indices].sum(axis=0)
+    props = {
+        "fe_type": fe_type, "parent_fe_id": parents, "coordination_number": cn,
+        "angle_rms": rms, "bond_distortion": distortion, "fe_site_scores": soft,
+        "fe_score_tet": soft[:, 0], "fe_score_oct": soft[:, 1], "fe_score_unknown": soft[:, 2],
+        "neighbor_stability": stability,
+        "soft_tet_parents": soft_parents[:, 0], "soft_oct_parents": soft_parents[:, 1],
+        "soft_unknown_parents": soft_parents[:, 2],
+        "parent_type_id": parent_type, "n_oct_parents": n_oct,
+        "n_tet_parents": n_tet, "n_other_parents": n_other,
+        "octahedral_count": int(np.count_nonzero(fe_type == 0)),
+        "tetrahedral_count": int(np.count_nonzero(fe_type == 1)),
+        "other_count": int(np.count_nonzero(fe_type == 2)),
+        "total_fe": len(fe_indices), "total_o": len(o_indices),
+        "octa_rms_list": rms[fe_type == 0].tolist(), "tetra_rms_list": rms[fe_type == 1].tolist(),
     }
+    props.update(classify_phases(structure, props, fe_to_o, o_to_fe, config, reference_model))
+    props["composition_atoms_inner"] = props["composition_sample_sizes"][:, 0]
+    props["composition_atoms_outer"] = props["composition_sample_sizes"][:, 1]
+    return props
+
+
+# Scalar diagnostics appended to both export formats with identical names.
+EXTRA_PROPERTIES = {
+    "bond_distortion": "R", "fe_score_tet": "R", "fe_score_oct": "R",
+    "fe_score_unknown": "R", "neighbor_stability": "R",
+    "soft_tet_parents": "R", "soft_oct_parents": "R", "soft_unknown_parents": "R",
+    "phase_id": "I", "phase_reason": "I", "phase_score_magnetite": "R",
+    "phase_score_wustite": "R", "phase_confidence": "R", "phase_support": "R",
+    "phase_distance_magnetite": "R", "phase_distance_wustite": "R",
+    "local_fe_o_ratio_inner": "R", "local_fe_o_ratio_outer": "R",
+    "second_shell_tet_fraction": "R", "second_shell_unknown_fraction": "R",
+    "composition_atoms_inner": "I", "composition_atoms_outer": "I",
+}
+
+
+def extra_values(props, index):
+    return " ".join(str(int(props[key][index])) if kind == "I" else f"{props[key][index]:.8f}"
+                    for key, kind in EXTRA_PROPERTIES.items())
 
 
 def write_extxyz(filepath: str, structure: Structure, props: Dict[str, Any]) -> None:
@@ -220,7 +185,9 @@ def write_extxyz(filepath: str, structure: Structure, props: Dict[str, Any]) -> 
         "coordination_number:I:1:angle_rms:R:1:parent_type_id:I:1:"
         "n_oct_parents:I:1:n_tet_parents:I:1:n_other_parents:I:1"
     )
-    header = f'Lattice="{lat_str}" {prop_header} pbc="T T T"'
+    prop_header += "".join(f":{key}:{kind}:1" for key, kind in EXTRA_PROPERTIES.items())
+    pbc = " ".join("T" if value else "F" for value in structure.lattice.pbc)
+    header = f'Lattice="{lat_str}" {prop_header} pbc="{pbc}"' 
 
     fe_type = props["fe_type"]
     cn = props["coordination_number"]
@@ -240,7 +207,7 @@ def write_extxyz(filepath: str, structure: Structure, props: Dict[str, Any]) -> 
                 f"{sym:<2} {x:12.6f} {y:12.6f} {z:12.6f} "
                 f"{fe_type[i]:3d} {p_str} "
                 f"{cn[i]:3d} {angle_rms_val[i]:10.4f} {parent_type_id[i]:3d} "
-                f"{n_oct[i]:3d} {n_tet[i]:3d} {n_oth[i]:3d}\n"
+                f"{n_oct[i]:3d} {n_tet[i]:3d} {n_oth[i]:3d} {extra_values(props, i)}\n"
             )
 
 
@@ -253,7 +220,22 @@ def write_lammps_dump(filepath: str, structure: Structure, frame_num: int,
     """
     n_atoms = len(structure)
     lat = structure.lattice
-    a, b, c = lat.a, lat.b, lat.c
+    # Rotate to a restricted triclinic LAMMPS cell without changing geometry.
+    a_vec, b_vec, c_vec = lat.matrix
+    lx = np.linalg.norm(a_vec)
+    e1 = a_vec / lx
+    xy, xz = np.dot(b_vec, e1), np.dot(c_vec, e1)
+    b_perp = b_vec - xy * e1
+    ly = np.linalg.norm(b_perp)
+    e2 = b_perp / ly
+    yz = np.dot(c_vec, e2)
+    lz = np.dot(c_vec, np.cross(e1, e2))
+    if lz <= 0:
+        raise ValueError("LAMMPS export requires a right-handed lattice")
+    restricted = np.array([[lx, 0, 0], [xy, ly, 0], [xz, yz, lz]])
+    positions = structure.frac_coords @ restricted
+    tilted = not np.allclose([xy, xz, yz], 0, atol=1e-10)
+    boundary = " ".join("pp" if value else "ff" for value in lat.pbc)
 
     parent_fe_id = props["parent_fe_id"]
     dim_p = parent_fe_id.shape[1]
@@ -270,24 +252,31 @@ def write_lammps_dump(filepath: str, structure: Structure, frame_num: int,
     with open(filepath, "w") as f:
         f.write(f"ITEM: TIMESTEP\n{frame_num}\n")
         f.write(f"ITEM: NUMBER OF ATOMS\n{n_atoms}\n")
-        f.write("ITEM: BOX BOUNDS pp pp pp\n")
-        f.write(f"0.000000 {a:.6f}\n")
-        f.write(f"0.000000 {b:.6f}\n")
-        f.write(f"0.000000 {c:.6f}\n")
+        if tilted:
+            f.write(f"ITEM: BOX BOUNDS xy xz yz {boundary}\n")
+            xlo = min(0., xy, xz, xy+xz)
+            xhi = lx + max(0., xy, xz, xy+xz)
+            ylo, yhi = min(0., yz), ly + max(0., yz)
+            f.write(f"{xlo:.10f} {xhi:.10f} {xy:.10f}\n")
+            f.write(f"{ylo:.10f} {yhi:.10f} {xz:.10f}\n")
+            f.write(f"0.0000000000 {lz:.10f} {yz:.10f}\n")
+        else:
+            f.write(f"ITEM: BOX BOUNDS {boundary}\n")
+            f.write(f"0.000000 {lx:.10f}\n0.000000 {ly:.10f}\n0.000000 {lz:.10f}\n")
         f.write(
             f"ITEM: ATOMS id type x y z fe_type {parent_cols} "
             "coordination_number angle_rms parent_type_id "
-            "n_oct_parents n_tet_parents n_other_parents\n"
+            "n_oct_parents n_tet_parents n_other_parents " + " ".join(EXTRA_PROPERTIES) + "\n"
         )
         for i, atom in enumerate(structure):
             atom_type = 1 if atom.specie.symbol == "Fe" else 2
-            x, y, z = atom.coords
+            x, y, z = positions[i]
             p_str = " ".join(f"{pid:6d}" for pid in parent_fe_id[i])
             f.write(
                 f"{i + 1:6d} {atom_type:2d} {x:12.6f} {y:12.6f} {z:12.6f} "
                 f"{fe_type[i]:3d} {p_str} "
                 f"{cn[i]:3d} {angle_rms_val[i]:10.4f} {parent_type_id[i]:3d} "
-                f"{n_oct[i]:3d} {n_tet[i]:3d} {n_oth[i]:3d}\n"
+                f"{n_oct[i]:3d} {n_tet[i]:3d} {n_oth[i]:3d} {extra_values(props, i)}\n"
             )
 
 
@@ -298,6 +287,8 @@ def process_single_frame(
     export_format: str = "both",
     t_limit: float = DEFAULT_TETRA_LIMIT,
     o_limit: float = DEFAULT_OCTA_LIMIT,
+    phase_config: Optional[PhaseConfig] = None,
+    reference_model: Optional[Dict[str, Any]] = None,
 ) -> Optional[Dict[str, Any]]:
     """
     Process a single frame:
@@ -314,7 +305,8 @@ def process_single_frame(
         return None
 
     structure = Structure.from_file(filepath)
-    props = calculate_frame_properties(structure, t_limit=t_limit, o_limit=o_limit)
+    props = calculate_frame_properties(structure, t_limit=t_limit, o_limit=o_limit,
+                                       phase_config=phase_config, reference_model=reference_model)
 
     os.makedirs(output_dir, exist_ok=True)
 
@@ -332,7 +324,7 @@ def process_single_frame(
     fe_total = props["total_fe"]
     o_total = props["total_o"]
 
-    return {
+    summary = {
         "frame": frame_num,
         "octahedral_fe": oct_count,
         "tetrahedral_fe": tet_count,
@@ -345,6 +337,16 @@ def process_single_frame(
         "mean_oct_rms": round(float(np.mean(props["octa_rms_list"])), 3) if props["octa_rms_list"] else None,
         "mean_tet_rms": round(float(np.mean(props["tetra_rms_list"])), 3) if props["tetra_rms_list"] else None,
     }
+
+    for species in ("Fe", "O"):
+        mask = np.array([site.specie.symbol == species for site in structure])
+        total = int(mask.sum())
+        for phase_id, name in PHASE_NAMES.items():
+            value = int(np.count_nonzero(props["phase_id"][mask] == phase_id))
+            summary[f"phase_{name}_{species.lower()}"] = value
+            summary[f"pct_phase_{name}_{species.lower()}"] = 100. * value / total if total else None
+    summary["interface_or_ambiguous_atoms"] = int(np.count_nonzero(props["phase_reason"] == 2))
+    return summary
 
 
 def main():
@@ -364,7 +366,19 @@ def main():
     parser.add_argument("--octa-limit", type=float, default=DEFAULT_OCTA_LIMIT, help="RMS cutoff for octahedral geometry (°)")
     parser.add_argument("--csv-filename", type=str, default="polyhedra_summary.csv", help="Name of summary CSV file")
 
+    parser.add_argument("--phase-config", help="JSON PhaseConfig overrides; see phase_config.json")
+    parser.add_argument("--reference-model", help="Fitted phase model from fit_phase_references.py")
     args = parser.parse_args()
+    try:
+        phase_config = PhaseConfig.load(args.phase_config)
+        reference_model = (load_reference_model(args.reference_model, phase_config,
+                           args.tetra_limit, args.octa_limit) if args.reference_model else None)
+        if not all(np.isfinite(x) and x > 0 for x in (args.tetra_limit, args.octa_limit)):
+            raise ValueError("Angle RMS cutoffs must be positive and finite")
+        if args.workers is not None and args.workers < 1:
+            raise ValueError("workers must be >= 1")
+    except (OSError, ValueError, KeyError, TypeError) as exc:
+        parser.error(str(exc))
 
     # Determine from_frame and to_frame (CLI arguments or interactive prompt)
     from_frame = args.from_frame if args.from_frame is not None else args.pos_from_frame
@@ -405,7 +419,19 @@ def main():
     print(f"Angle RMS cutoffs : Tetrahedral <= {args.tetra_limit}°, Octahedral <= {args.octa_limit}°")
     print("=" * 65)
 
+    os.makedirs(args.output_dir, exist_ok=True)
+    with open(os.path.join(args.output_dir, "phase_metadata.json"), "w") as stream:
+        json.dump({"phase_ids": PHASE_NAMES, "phase_reasons": REASONS,
+                   "feature_names": FEATURE_NAMES, "phase_config": asdict(phase_config),
+                   "tetra_limit": args.tetra_limit, "octa_limit": args.octa_limit,
+                   "reference_model": reference_model,
+                   "phase_scores": "relative similarity, not calibrated probabilities",
+                   "atom_ids": "1-based POSCAR site indices; not guaranteed persistent between frames",
+                   "frames_dir": os.path.abspath(args.frames_dir),
+                   "requested_frames": [from_frame, to_frame]},
+                  stream, indent=2)
     results = []
+    failures = 0
     if num_workers > 1:
         try:
             import multiprocessing as mp
@@ -423,6 +449,8 @@ def main():
                     args.format,
                     args.tetra_limit,
                     args.octa_limit,
+                    phase_config,
+                    reference_model,
                 ): f
                 for f in frames
             }
@@ -439,6 +467,7 @@ def main():
                             f"Other: {res['other_fe']:4d} ({res['pct_other']:5.1f}%)"
                         )
                 except Exception as e:
+                    failures += 1
                     print(f"[Error] Frame {frame_idx} failed: {e}", file=sys.stderr)
     else:
         for f in frames:
@@ -450,6 +479,8 @@ def main():
                     args.format,
                     args.tetra_limit,
                     args.octa_limit,
+                    phase_config,
+                    reference_model,
                 )
                 if res:
                     results.append(res)
@@ -460,6 +491,7 @@ def main():
                         f"Other: {res['other_fe']:4d} ({res['pct_other']:5.1f}%)"
                     )
             except Exception as e:
+                failures += 1
                 print(f"[Error] Frame {f} failed: {e}", file=sys.stderr)
 
     if not results:
@@ -481,6 +513,9 @@ def main():
     print(f"OVITO trajectory files saved in: {args.output_dir}/")
     print("\nSummary Preview:")
     print(df.to_string(index=False))
+    if failures:
+        print(f"{failures} frame(s) failed; summary contains successful frames only.", file=sys.stderr)
+        sys.exit(1)
 
 
 if __name__ == "__main__":

@@ -1,0 +1,16 @@
+{
+  "composition_radii": [6.0, 9.0],
+  "min_composition_atoms": 24,
+  "min_confidence": 0.8,
+  "max_distance": 16.0,
+  "max_unknown_fraction": 0.5,
+  "min_spatial_support": 0.55,
+  "smoothing_strength": 0.25,
+  "fingerprint_sigma": 1.5,
+  "spatial_sigma": 4.0,
+  "fe_min_support": 0.6,
+  "bond_limit": 0.2,
+  "neighbor_method": "crystalnn",
+  "bond_cutoff": 2.8,
+  "cutoff_delta": 0.1
+}
